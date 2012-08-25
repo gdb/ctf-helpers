@@ -1,0 +1,238 @@
+#!/usr/bin/env ruby
+require 'logger'
+require 'optparse'
+require 'socket'
+
+require 'rubygems'
+require 'fcgi'
+
+$log = Logger.new(STDERR)
+$log.level = Logger::WARN
+
+module FCGIShim
+  class Runner
+    # TODO: install sigchld handler?
+    def initialize(command)
+      @command = command
+      @sockpath = `mktemp -u`.strip
+
+      spinup
+      register_sigchild_handler
+      register_at_exit
+    end
+
+    def spinup
+      @child = fork do
+        command_name, args = substituted_command
+        $log.info("Spinning up a #{command_name}")
+        $log.debug("Subprocess args are #{args.inspect} (original: #{@command.inspect})")
+        exec([command_name, command_name], *args)
+      end
+    end
+
+    def substituted_command
+      command_name = @command[0]
+      args = @command[1..-1]
+
+      count = 0
+      args = args.map do |arg|
+        arg.gsub('[fcgi-shim-socket]') do
+          count += 1
+          @sockpath
+        end
+      end
+
+      if count == 0
+        args += [@sockpath]
+      elsif count > 1
+        raise "Too many [fcgi-shim-socket]s: #{@command.inspect}"
+      end
+
+      [command_name, args]
+    end
+
+    def register_sigchild_handler
+      Signal.trap("CHLD") do
+        $log.error("Child just died! Exiting.")
+        exit(0)
+      end
+    end
+
+    def register_at_exit
+      at_exit do
+        Signal.trap("CHLD", nil)
+        begin
+          $log.info("Unlinking socket at #{@sockpath}.")
+          File.unlink(@sockpath)
+        rescue Errno::ENOENT
+          $log.error("There was no socket at #{@sockpath}.")
+        end
+
+        if @child
+          begin
+            Process.kill('TERM', @child)
+          rescue Errno::ESRCH
+            $log.error("Child process #{@child} is already dead")
+          else
+            $log.info("Successfully killed child process #{@child}")
+          end
+
+          # TODO: do a wait instead of sleeping?
+          sleep(0.5)
+
+          begin
+            Process.kill('KILL', @child)
+          rescue Errno::ESRCH
+          else
+            $log.error("TERM hadn't worked, so ended up KILLing #{@child}")
+          end
+        end
+      end
+    end
+
+    def connect
+      40.times do |i|
+        begin
+          sock = UNIXSocket.new(@sockpath)
+        rescue Errno::ENOENT
+          $log.debug("No socket yet; waiting (try #{i})")
+          sleep(0.1)
+        else
+          $log.info("Connected to child at #{@sockpath}.")
+          return sock
+        end
+      end
+
+      raise "Could not connect to child at #{@sockpath}"
+    end
+
+    def extract_headers(request)
+      http_headers = request.env.select do |key, value|
+        key.start_with?('HTTP_') ||
+          key == 'CONTENT_LENGTH' ||
+          key == 'CONTENT_TYPE'
+      end
+
+      headers = http_headers.map do |key, value|
+        key = $1 if key =~ /^HTTP_(.*)$/
+        key = key.split('_').map {|component| component.capitalize}.join('-')
+        [key, value]
+      end
+
+      headers
+    end
+
+    def construct_http_line(request)
+      # Don't use request.env['SERVER_PROTOCOL']. Otherwise who knows
+      # what you'll get back.
+      "#{request.env['REQUEST_METHOD']} #{request.env['REQUEST_URI']} HTTP/1.0"
+    end
+
+    def construct_headers(request)
+      headers = extract_headers(request)
+      headers.map {|header, value| "#{header}: #{value}"}
+    end
+
+    def emit(tag, sock, bytes)
+      return unless bytes
+      $log.debug("[#{tag}] Emit: #{bytes.inspect}")
+      sock.write(bytes)
+      sock.flush
+    end
+
+    def emit_newline(tag, sock)
+      emit(tag, sock, "\r\n")
+    end
+
+    def emit_request(tag, sock, http_line, headers, body_file)
+      emit(tag, sock, http_line)
+      emit_newline(tag, sock)
+
+      headers.each do |header|
+        emit(tag, sock, header)
+        emit_newline(tag, sock)
+      end
+
+      emit_newline(tag, sock)
+      stream(body_file) {|chunk| emit(tag, sock, chunk)}
+    end
+
+    def stream(file, &blk)
+      until file.eof?
+        data = file.read(4096)
+        blk.call(data)
+      end
+    end
+
+    def transform_status_code(chunk)
+      if chunk =~ %r{^HTTP/[0-9.]+ (\d+.*)$}m
+        "Status: #{$1}"
+      else
+        raise "Could not parse out status code: #{chunk.inspect}"
+      end
+    end
+
+    def run
+      FCGI.each {|request|
+        input = request.in
+        output = request.out
+
+        http_line = construct_http_line(request)
+        headers = construct_headers(request)
+
+        upstream = connect
+        # Write data to sock
+        emit_request('request', upstream, http_line, headers, input)
+
+        chunk_count = 0
+        # Read data from sock
+        stream(upstream) do |chunk|
+          # Huge hack because CGI is lame
+          chunk = transform_status_code(chunk) if chunk_count == 0
+          chunk_count += 1
+          emit('reply', output, chunk)
+        end
+        # All done
+        upstream.close
+
+        request.finish
+      }
+    end
+  end
+end
+
+def main
+  options = {}
+  optparse = OptionParser.new do |opts|
+    opts.banner = "Usage: #{$0} [options] command [args]"
+
+    opts.on('-v', '--verbosity', 'Verbosity of debugging output') do
+      $log.level -= 1
+    end
+
+    opts.on('-h', '--help', 'Display this message') do
+      puts opts
+      exit(1)
+    end
+  end
+  optparse.parse!
+
+  if ARGV.length < 1
+    puts optparse
+    return 1
+  end
+
+  command = ARGV
+  runner = FCGIShim::Runner.new(command)
+  runner.run
+  return 0
+end
+
+if $0 == __FILE__
+  ret = main
+  begin
+    exit(ret)
+  rescue TypeError
+    exit(0)
+  end
+end
